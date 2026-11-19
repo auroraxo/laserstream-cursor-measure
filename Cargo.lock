@@ -1289,7 +1289,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helius-laserstream"
-version = "0.0.0"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf8335daa71115828ae136b6eea721b3d5e1997ff3e837eb28ddd0e4505fe12"
 dependencies = [
  "async-stream",
  "bs58",

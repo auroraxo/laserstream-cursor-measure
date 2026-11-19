@@ -323,7 +323,7 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
             Script::SlotTickInternalOnly => "C: slot tick tagged ONLY with the SDK internal slot filter (the face PR #114 addresses)",
             Script::PayloadOnly => "CONTROL: no slot update delivered at all (payload-only stream)",
         },
-        "sdk_head": "379a6ba (Update SDK to Agave 4.4 Core)",
+        "sdk_source": "helius-laserstream 2.0.0 from crates.io (its client.rs cursor logic is byte-identical to main 379a6ba: tracked_slot = s.slot on any slot update, payload slots never advance the cursor)",
         "mock_ignores_from_slot": true,
         "server_behavior": "the mock replays its fixed script regardless of from_slot; reconnect_from_slot is the measurement",
         "commitment": "confirmed",

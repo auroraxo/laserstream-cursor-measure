@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 laserstream-core-proto = { version = "14.0.0", default-features = false, features = ["tonic"] }
-helius-laserstream = { path = "../laserstream-sdk/rust" }
+helius-laserstream = "2.0.0"
 tonic = { version = "0.12.1", features = ["transport", "tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = "0.1"

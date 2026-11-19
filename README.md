@@ -16,7 +16,7 @@ The mock replays its fixed script regardless of the `from_slot` it receives,
 so the numbers below say nothing about any real server; they say what the
 SDK asks for after the disconnect.
 
-## Measured (SDK `main` @ `379a6ba`, laserstream-core 14.0.0, CONFIRMED request, replay on)
+## Measured (helius-laserstream 2.0.0 from crates.io == SDK `main` @ `379a6ba`, laserstream-core 14.0.0, CONFIRMED request, replay on)
 
 | script | reconnect `from_slot` | slots a from_slot-honoring server would never re-deliver |
 |---|---|---|
@@ -37,9 +37,12 @@ cargo run
 # writes laserstream-115-{variant-a,variant-b,variant-c,control}-<date>.json
 ```
 
-~15 s, no network, no API key. Dependencies: `helius-laserstream` (path to a
-checkout of the SDK under `../laserstream-sdk`), `laserstream-core-proto`,
-`tonic`, `tokio`.
+~15 s after the first build, no network, no API key, no SDK checkout: the
+harness depends on `helius-laserstream = "2.0.0"` from crates.io. The
+published 2.0.0 carries the same cursor code as `main` `379a6ba` (verified
+line-by-line: `tracked_slot = s.slot` on any slot update, payload slots never
+advance the cursor), and a run against the local `main` checkout produced
+byte-identical numbers for all four variants.
 
 ## Artifacts
 
