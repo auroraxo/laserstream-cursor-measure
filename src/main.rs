@@ -22,7 +22,7 @@
 use laserstream_core_proto::geyser::{
     geyser_server::{Geyser, GeyserServer},
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterSlots, SubscribeUpdate, SubscribeUpdateAccount,
+    SubscribeRequestFilterSlots, SubscribeRequestFilterBlockFooter, SubscribeUpdate, SubscribeUpdateAccount,
     SubscribeUpdateAccountInfo, SubscribeUpdateSlot, SubscribeReplayInfoRequest,
     SubscribeReplayInfoResponse, SubscribeReplayInfoRequest as _R, PingRequest, PongResponse,
 };
@@ -49,6 +49,13 @@ enum Script {
     /// payload 90, payload 91, CONFIRMED slot tick @122 tagged ONLY with the SDK's
     /// internal slot filter id (the face PR #114 addresses), stream end
     SlotTickInternalOnly,
+    /// payload 90, payload 91, then a BLOCK FOOTER at slot 122 on a user filter
+    /// (the only non-slot update that advances the cursor on main), stream end
+    BlockFooter,
+    /// a FOOTER-ONLY subscription: footers 90, 91 and the live-head footer 122,
+    /// no account payloads at all, stream end. The cursor then has only the
+    /// footer to advance from.
+    FooterOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -60,11 +67,18 @@ struct Conn {
 #[derive(Debug, Default, Clone)]
 struct Observed {
     conns: Vec<Conn>,
+    /// account payload slots delivered, tagged with the connection index
+    account_slots: Vec<(usize, u64)>,
+    /// block footer slots delivered, tagged with the connection index
+    footer_slots: Vec<(usize, u64)>,
 }
 
 struct MockGeyser {
     script: Script,
     observed: Arc<Mutex<Observed>>,
+    /// when true the reconnect branch serves what a COMPLIANT server would
+    /// serve for the requested from_slot (inclusive) instead of a fixed script
+    honor_from_slot: bool,
 }
 
 fn account_payload(slot: u64) -> SubscribeUpdate {
@@ -152,9 +166,32 @@ impl Geyser for MockGeyser {
         }
         let script = self.script;
         let observed = self.observed.clone();
+        let honor = self.honor_from_slot;
+        let conn_index = {
+            let mut o = self.observed.lock().unwrap();
+            o.conns.len().saturating_sub(1)
+        };
+        let reconnect_from = first.from_slot;
         let stream = async_stream::stream! {
             if !is_reconnect {
+                if script == Script::FooterOnly {
+                    // A footer-only consumer: the cursor can only advance from a footer.
+                    {
+                        let mut o = observed.lock().unwrap();
+                        o.footer_slots.push((conn_index, 90));
+                        o.footer_slots.push((conn_index, LAST_DELIVERED));
+                        o.footer_slots.push((conn_index, LIVE_SLOT));
+                    }
+                    yield Ok(block_footer(90, "footers".to_string()));
+                    yield Ok(block_footer(LAST_DELIVERED, "footers".to_string()));
+                    yield Ok(block_footer(LIVE_SLOT, "footers".to_string()));
+                } else {
                 // First connection: deliver the payloads, then (maybe) the racing tick.
+                {
+                    let mut o = observed.lock().unwrap();
+                    o.account_slots.push((conn_index, 90));
+                    o.account_slots.push((conn_index, LAST_DELIVERED));
+                }
                 yield Ok(account_payload(90));
                 yield Ok(account_payload(LAST_DELIVERED));
                 if script == Script::SlotTick {
@@ -163,13 +200,43 @@ impl Geyser for MockGeyser {
                     yield Ok(slot_tick_status(LIVE_SLOT, true, CommitmentLevel::Confirmed));
                 } else if script == Script::SlotTickInternalOnly {
                     yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
+                } else if script == Script::BlockFooter {
+                    {
+                        let mut o = observed.lock().unwrap();
+                        o.footer_slots.push((conn_index, LIVE_SLOT));
+                    }
+                    yield Ok(block_footer(122, "footers".to_string()));
+                }
                 }
                 // stream ends -> the SDK reconnects
             } else {
-                // Reconnect: serve the range the consumer never got, 92..=121,
-                // so a correct resume delivers all of it.
-                for s in EXPECTED_RESUME..LIVE_SLOT {
+                if script == Script::FooterOnly {
+                    // A compliant server resumes AT the requested from_slot (inclusive).
+                    let start = reconnect_from.unwrap_or(90);
+                    for s in start..=LIVE_SLOT {
+                        {
+                            let mut o = observed.lock().unwrap();
+                            o.footer_slots.push((conn_index, s));
+                        }
+                        yield Ok(block_footer(s, "footers".to_string()));
+                    }
+                } else {
+                // Reconnect. A COMPLIANT server resumes AT the requested
+                // from_slot (inclusive) and serves everything from there on.
+                // A NON-compliant mock ignores from_slot and always serves the
+                // range 92..=121, which is what makes the skip visible.
+                let start = if honor {
+                    reconnect_from.unwrap_or(EXPECTED_RESUME)
+                } else {
+                    EXPECTED_RESUME
+                };
+                for s in start..LIVE_SLOT {
+                    {
+                        let mut o = observed.lock().unwrap();
+                        o.account_slots.push((conn_index, s));
+                    }
                     yield Ok(account_payload(s));
+                }
                 }
                 // Keep the connection open briefly so the SDK has time to deliver
                 // before we end the stream and force yet another reconnect loop.
@@ -236,12 +303,17 @@ impl Geyser for MockGeyser {
 }
 
 async fn start_server(script: Script) -> (String, Arc<Mutex<Observed>>, tokio::task::JoinHandle<()>) {
+    start_server_with(script, false).await
+}
+
+async fn start_server_with(script: Script, honor_from_slot: bool) -> (String, Arc<Mutex<Observed>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let observed = Arc::new(Mutex::new(Observed::default()));
     let service = MockGeyser {
         script,
         observed: observed.clone(),
+        honor_from_slot,
     };
     let incoming = async_stream::stream! {
         loop { yield listener.accept().await.map(|(socket, _)| socket); }
@@ -254,6 +326,16 @@ async fn start_server(script: Script) -> (String, Arc<Mutex<Observed>>, tokio::t
             .unwrap();
     });
     (endpoint, observed, task)
+}
+
+fn block_footer(slot: u64, filter_id: String) -> SubscribeUpdate {
+    SubscribeUpdate {
+        filters: vec![filter_id],
+        update_oneof: Some(laserstream_core_proto::geyser::subscribe_update::UpdateOneof::BlockFooter(
+            laserstream_core_proto::geyser::SubscribeUpdateBlockFooter { slot, ..Default::default() },
+        )),
+        ..Default::default()
+    }
 }
 
 fn client_request() -> SubscribeRequest {
@@ -270,16 +352,24 @@ fn client_request() -> SubscribeRequest {
             interslot_updates: None,
         },
     );
+    let mut footers: HashMap<String, SubscribeRequestFilterBlockFooter> = HashMap::new();
+    footers.insert("footers".to_string(), SubscribeRequestFilterBlockFooter::default());
     SubscribeRequest {
         accounts,
         slots,
+        block_footer: footers,
         commitment: Some(CommitmentLevel::Confirmed as i32),
         ..Default::default()
     }
 }
 
 async fn run(script: Script, out_path: &str) -> serde_json::Value {
-    let (endpoint, observed, task) = start_server(script).await;
+    let honor = std::env::var("HONOR_FROM_SLOT").is_ok();
+    let (endpoint, observed, task) = if honor {
+        start_server_with(script, true).await
+    } else {
+        start_server(script).await
+    };
     let config = LaserstreamConfig {
         api_key: String::new(),
         endpoint,
@@ -322,6 +412,8 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
             Script::SlotTickMatchingCommitment => "B: user slot filter with filter_by_commitment, tick status CONFIRMED == request commitment (issue #115 case 2)",
             Script::SlotTickInternalOnly => "C: slot tick tagged ONLY with the SDK internal slot filter (the face PR #114 addresses)",
             Script::PayloadOnly => "CONTROL: no slot update delivered at all (payload-only stream)",
+            Script::BlockFooter => "D: BLOCK FOOTER at 122 on a user filter (the non-slot update that advances the cursor on main; PR #114's replay_cursor_slot omits BlockFooter)",
+            Script::FooterOnly => "E: FOOTER-ONLY subscription (footers 90, 91, live-head 122; no account payloads) — the live-head footer alone in the cursor",
         },
         "sdk_source": "helius-laserstream 2.0.0 from crates.io (its client.rs cursor logic is byte-identical to main 379a6ba: tracked_slot = s.slot on any slot update, payload slots never advance the cursor)",
         "mock_ignores_from_slot": true,
@@ -331,6 +423,10 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
             "payload@90, payload@91, PROCESSED slot tick @122 (user filter), stream end -> reconnect"
         } else if script == Script::SlotTickMatchingCommitment {
             "payload@90, payload@91, CONFIRMED slot tick @122 (status == request commitment), stream end -> reconnect"
+        } else if script == Script::BlockFooter {
+            "payload@90, payload@91, BLOCK FOOTER@122 (user filter 'footers'), stream end -> reconnect"
+        } else if script == Script::FooterOnly {
+            "footer@90, footer@91, footer@122 (live head), stream end -> reconnect"
         } else {
             "payload@90, payload@91, stream end -> reconnect"
         },
@@ -341,6 +437,10 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
         "slots_a_compliant_server_would_never_redeliver": skipped,
         "defect_present": matches!(reconnect_from, Some(s) if s > LAST_DELIVERED),
         "skipped_range_size": SKIPPED_RANGE,
+        "compliant_server_mode": honor,
+        "delivered_account_slots_by_conn": obs.account_slots,
+        "delivered_footer_slots_by_conn": obs.footer_slots,
+        "footer_only_consumer": script == Script::FooterOnly,
     });
     std::fs::write(out_path, serde_json::to_string_pretty(&res).unwrap()).unwrap();
     task.abort();
@@ -372,6 +472,18 @@ async fn run_both() {
     )
     .await;
     println!("VARIANT C: {}", serde_json::to_string_pretty(&cc).unwrap());
+    let d = run(
+        Script::BlockFooter,
+        &format!("{dir}/laserstream-115-variant-d-footer-2026-11-19.json"),
+    )
+    .await;
+    println!("VARIANT D: {}", serde_json::to_string_pretty(&d).unwrap());
+    let e = run(
+        Script::FooterOnly,
+        &format!("{dir}/laserstream-115-variant-e-footer-only-2026-11-19.json"),
+    )
+    .await;
+    println!("VARIANT E: {}", serde_json::to_string_pretty(&e).unwrap());
     let c = run(
         Script::PayloadOnly,
         &format!("{dir}/laserstream-115-control-2026-11-19.json"),

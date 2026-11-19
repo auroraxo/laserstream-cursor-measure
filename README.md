@@ -30,11 +30,47 @@ SDK asks for after the disconnect.
 - The false-positive guard holds: with no slot update in the stream the
   client does not fabricate a cursor (`from_slot` unset).
 
+## The PR #114 two-rule matrix (2026-11-19, compliant-server mode)
+
+The question the thread moved to after
+[my 2026-11-19 measurement](https://github.com/helius-labs/laserstream-sdk/issues/115#issuecomment-7016745189):
+does the cursor rule PR #114 proposes (`replay_cursor_slot`) reach the faces
+the issue reports, when the SERVER is compliant — i.e. reconnect serves from
+the requested `from_slot` inclusively? Run it with `HONOR_FROM_SLOT=1`:
+
+| script | main rule | PR #114 rule |
+|---|---|---|
+| A: PROCESSED tick @122, user filter, no `filter_by_commitment` (#115 case 1) | **loss 92–121** | **loss 92–121 (NOT fixed)** |
+| B: CONFIRMED tick @122, user filter with `filter_by_commitment` (#115 case 2) | **loss 92–121** | **loss 92–121 (NOT fixed)** |
+| C: tick tagged ONLY with the SDK internal filter (what PR #114 addresses) | loss 92–121 | **fixed**: from=91, one duplicate |
+| D: BLOCK FOOTER @122 on a user filter | **loss 92–121** (main's `footer_resume_slot`) | **fixed as a side effect** (BlockFooter omitted from the rule) |
+| E: footer-only subscription (no slot updates at all) | **loss 90–121** (cursor rides the live-head footer) | zero loss, but the cursor never advances: `from_slot` unset on every reconnect → permanent duplicates |
+| control: payload-only stream | ok (from unset, duplicates 90, 91) | ok (from=91, duplicate 91) |
+
+The headline: PR #114's rule is "any non-internal-filter update advances the
+cursor", not "only delivered payloads advance". Its own tests cover exactly
+two cases (internal-only slot update ignored; delivered Block advances) — the
+user-slot-tick faces A and B, which are the faces #115 is about, still skip
+30 slots on a compliant server. A full fix needs the rule to advance ONLY on
+account/tx/block-meta payload slots (or their delivered footers), regardless
+of which filter matched.
+
+New faces on `main` (not in #115): D — a block footer at live head advances
+the cursor past the replay range — and E — a footer-only consumer loses its
+whole delivered range when the live-head footer arrives.
+
+Per-cell JSON: `research/laserstream-115-{main,pr114}-{control,variant-a..e}-2026-11-19.json`,
+matrix summary: `research/laserstream-115-pr114-two-rule-matrix-2026-11-19.json`.
+The PR #114 diff this measured is vendored verbatim at
+`tools/pr114-replay-cursor.patch` (branch `bert/replay-cursor-from-delivered-update`,
+head `708edd3`).
+
 ## Run
 
 ```bash
-cargo run
-# writes laserstream-115-{variant-a,variant-b,variant-c,control}-<date>.json
+cargo run                      # non-compliant server: makes the skip visible
+HONOR_FROM_SLOT=1 cargo run    # compliant server: what the consumer actually receives
+# writes laserstream-115-{variant-a,variant-b,variant-c,variant-d-footer,variant-e-footer-only,control}-<date>.json
 ```
 
 ~15 s after the first build, no network, no API key, no SDK checkout: the
