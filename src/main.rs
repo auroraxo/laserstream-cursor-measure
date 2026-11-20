@@ -56,7 +56,36 @@ enum Script {
     /// no account payloads at all, stream end. The cursor then has only the
     /// footer to advance from.
     FooterOnly,
+    /// QUIET: payload 90, payload 91, then the SDK's INTERNAL slot tracker
+    /// ticks at the live head (122) — tagged ONLY with the internal filter id
+    /// — and the subscription goes quiet: no further payloads, no further
+    /// ticks. The chain advances while the consumer is silent.
+    QuietWindow,
+    /// QUIET + HELD: the same quiet subscription, but the server's replay
+    /// window still holds the last delivered payload slot.
+    QuietResume,
 }
+
+/// A quiet-subscription scenario: the server's replay window and what it does
+/// with a from_slot.
+///
+/// `window_floor` is the lowest slot the server can still replay. A request
+/// below it is refused with OUT_OF_RANGE — the real LaserStream behaviour for
+/// a slot that has aged out of retention. A request at or above it is served
+/// from that slot (inclusive).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QuietScenario {
+    window_floor: u64,
+}
+
+/// The window slid on: silence outlasted retention, so the floor moved past
+/// even the live-head slot the SDK's internal tracker rides (122). A cursor
+/// that asks for 122 is now refused; a payload-only cursor sends NO from_slot
+/// and cannot be refused at all.
+const QUIET_AGED: QuietScenario = QuietScenario { window_floor: LIVE_SLOT + 8 };
+
+/// The window still holds the last delivered payload (91): the replay works.
+const QUIET_RESUME: QuietScenario = QuietScenario { window_floor: 0 };
 
 #[derive(Debug, Clone)]
 struct Conn {
@@ -71,6 +100,12 @@ struct Observed {
     account_slots: Vec<(usize, u64)>,
     /// block footer slots delivered, tagged with the connection index
     footer_slots: Vec<(usize, u64)>,
+    /// gRPC status codes the consumer stream surfaced to the application
+    consumer_errors: Vec<String>,
+    /// how many times the server answered OUT_OF_RANGE
+    out_of_range_replies: usize,
+    /// wall-clock delay between two consecutive connect attempts
+    reconnect_delays_ms: Vec<u128>,
 }
 
 struct MockGeyser {
@@ -79,6 +114,11 @@ struct MockGeyser {
     /// when true the reconnect branch serves what a COMPLIANT server would
     /// serve for the requested from_slot (inclusive) instead of a fixed script
     honor_from_slot: bool,
+    /// for QUIET scripts: retention floor and what the server replays when
+    /// the window still covers the request
+    quiet: Option<QuietScenario>,
+    /// the OUT_OF_RANGE status text served when the request is below the floor
+    out_of_range_detail: String,
 }
 
 fn account_payload(slot: u64) -> SubscribeUpdate {
@@ -167,6 +207,8 @@ impl Geyser for MockGeyser {
         let script = self.script;
         let observed = self.observed.clone();
         let honor = self.honor_from_slot;
+        let quiet = self.quiet;
+        let oor_detail = self.out_of_range_detail.clone();
         let conn_index = {
             let mut o = self.observed.lock().unwrap();
             o.conns.len().saturating_sub(1)
@@ -200,6 +242,13 @@ impl Geyser for MockGeyser {
                     yield Ok(slot_tick_status(LIVE_SLOT, true, CommitmentLevel::Confirmed));
                 } else if script == Script::SlotTickInternalOnly {
                     yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
+                } else if script == Script::QuietWindow || script == Script::QuietResume {
+                    // QUIET: deliver the two payloads, then exactly ONE live
+                    // tick from the SDK's own internal tracker — tagged only
+                    // with the internal filter id, like a real LaserStream
+                    // server keeps ticking while the user's subscription is
+                    // quiet — then the subscription goes silent.
+                    yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
                 } else if script == Script::BlockFooter {
                     {
                         let mut o = observed.lock().unwrap();
@@ -220,6 +269,48 @@ impl Geyser for MockGeyser {
                         }
                         yield Ok(block_footer(s, "footers".to_string()));
                     }
+                } else if script == Script::QuietWindow || script == Script::QuietResume {
+                    // A from_slot AT OR ABOVE the window floor is served from
+                    // that slot (inclusive); a from_slot BELOW it is refused
+                    // with OUT_OF_RANGE, like a real server whose retention
+                    // moved on. A reconnect with NO cursor at all is served
+                    // from the last delivered payload — a server cannot skip
+                    // what was never requested.
+                    let q = quiet.expect("quiet scripts carry a QuietScenario");
+                    if let Some(f) = first.from_slot {
+                        if f < q.window_floor {
+                            {
+                                let mut o = observed.lock().unwrap();
+                                o.out_of_range_replies += 1;
+                            }
+                            yield Err(Status::out_of_range(oor_detail));
+                        } else {
+                            for s in f..=LIVE_SLOT {
+                                {
+                                    let mut o = observed.lock().unwrap();
+                                    o.account_slots.push((conn_index, s));
+                                }
+                                yield Ok(account_payload(s));
+                            }
+                            // keep the tracker alive on this connection too
+                            yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
+                        }
+                        // Hold the connection open so a retrying client sits on it.
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                    } else {
+                        // No cursor in the request: a real server replays from
+                        // its earliest held slot (first_available = the floor).
+                        let start = std::cmp::max(90, q.window_floor.min(LIVE_SLOT + 1));
+                        for s in start..=LIVE_SLOT {
+                            {
+                                let mut o = observed.lock().unwrap();
+                                o.account_slots.push((conn_index, s));
+                            }
+                            yield Ok(account_payload(s));
+                        }
+                        yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
                 } else {
                 // Reconnect. A COMPLIANT server resumes AT the requested
                 // from_slot (inclusive) and serves everything from there on.
@@ -237,11 +328,11 @@ impl Geyser for MockGeyser {
                     }
                     yield Ok(account_payload(s));
                 }
-                }
                 // Keep the connection open briefly so the SDK has time to deliver
                 // before we end the stream and force yet another reconnect loop.
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 let _ = observed.clone();
+                }
             }
         };
         Ok(Response::new(Box::pin(stream)))
@@ -303,10 +394,18 @@ impl Geyser for MockGeyser {
 }
 
 async fn start_server(script: Script) -> (String, Arc<Mutex<Observed>>, tokio::task::JoinHandle<()>) {
-    start_server_with(script, false).await
+    start_server_full(script, false, None).await
 }
 
 async fn start_server_with(script: Script, honor_from_slot: bool) -> (String, Arc<Mutex<Observed>>, tokio::task::JoinHandle<()>) {
+    start_server_full(script, honor_from_slot, None).await
+}
+
+async fn start_server_full(
+    script: Script,
+    honor_from_slot: bool,
+    quiet: Option<QuietScenario>,
+) -> (String, Arc<Mutex<Observed>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let observed = Arc::new(Mutex::new(Observed::default()));
@@ -314,6 +413,12 @@ async fn start_server_with(script: Script, honor_from_slot: bool) -> (String, Ar
         script,
         observed: observed.clone(),
         honor_from_slot,
+        quiet,
+        // The error text a from_slot-below-retention request produces.
+        out_of_range_detail: format!(
+            "requested from_slot is before the replay window: window_floor={} (harness)",
+            quiet.map(|q| q.window_floor).unwrap_or(0)
+        ),
     };
     let incoming = async_stream::stream! {
         loop { yield listener.accept().await.map(|(socket, _)| socket); }
@@ -364,11 +469,20 @@ fn client_request() -> SubscribeRequest {
 }
 
 async fn run(script: Script, out_path: &str) -> serde_json::Value {
+    run_with(script, out_path, false).await
+}
+
+async fn run_with(script: Script, out_path: &str, quiet_run: bool) -> serde_json::Value {
+    let quiet = if quiet_run {
+        Some(if script == Script::QuietResume { QUIET_RESUME } else { QUIET_AGED })
+    } else {
+        None
+    };
     let honor = std::env::var("HONOR_FROM_SLOT").is_ok();
     let (endpoint, observed, task) = if honor {
-        start_server_with(script, true).await
+        start_server_full(script, true, quiet).await
     } else {
-        start_server(script).await
+        start_server_full(script, false, quiet).await
     };
     let config = LaserstreamConfig {
         api_key: String::new(),
@@ -377,7 +491,30 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
         channel_options: helius_laserstream::ChannelOptions::default(),
         replay: true,
     };
-    let (stream, _handle) = subscribe(config, client_request());
+    // The client subscription uses `subscribe` (default options) or
+    // `subscribe_with_options` when intra-slot updates are requested.
+    type ClientStream = std::pin::Pin<
+        Box<dyn futures::Stream<
+            Item = Result<
+                laserstream_core_proto::geyser::SubscribeUpdate,
+                helius_laserstream::LaserstreamError,
+            >,
+        > + Send>,
+    >;
+    let (stream, _handle): (ClientStream, _) = match std::env::var("INTRA_SLOT_UPDATES").as_deref() {
+        Ok("1") => {
+            let (s, h) = helius_laserstream::subscribe_with_options(
+                config,
+                client_request(),
+                helius_laserstream::SubscribeOptions::default().with_intra_slot_updates(true),
+            );
+            (Box::pin(s) as ClientStream, h)
+        }
+        _ => {
+            let (s, h) = subscribe(config, client_request());
+            (Box::pin(s) as ClientStream, h)
+        }
+    };
     futures::pin_mut!(stream);
     let mut delivered: Vec<u64> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
@@ -394,7 +531,11 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
                     break;
                 }
             }
-            Ok(Some(Err(_))) | Ok(None) | Err(_) => {}
+            Ok(Some(Err(err))) => {
+                let mut o = observed.lock().unwrap();
+                o.consumer_errors.push(format!("{err}"));
+            }
+            Ok(None) | Err(_) => {}
         }
     }
     let obs = observed.lock().unwrap().clone();
@@ -405,8 +546,18 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
         Some(from) if from > LAST_DELIVERED => (LAST_DELIVERED + 1..from).collect(),
         _ => Vec::new(),
     };
+    let quiet_flag = matches!(script, Script::QuietWindow | Script::QuietResume);
     let res = serde_json::json!({
         "issue": "helius-labs/laserstream-sdk#115",
+        "scenario": if quiet_flag {
+            if script == Script::QuietResume {
+                "QUIET_RESUME: window still holds the cursor slot -> replay"
+            } else {
+                "QUIET_AGED: window slid past -> OUT_OF_RANGE"
+            }
+        } else {
+            "two-window skip race"
+        },
         "variant": match script {
             Script::SlotTick => "A: user slot filter without filter_by_commitment, tick status PROCESSED (issue #115 case 1)",
             Script::SlotTickMatchingCommitment => "B: user slot filter with filter_by_commitment, tick status CONFIRMED == request commitment (issue #115 case 2)",
@@ -414,11 +565,19 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
             Script::PayloadOnly => "CONTROL: no slot update delivered at all (payload-only stream)",
             Script::BlockFooter => "D: BLOCK FOOTER at 122 on a user filter (the non-slot update that advances the cursor on main; PR #114's replay_cursor_slot omits BlockFooter)",
             Script::FooterOnly => "E: FOOTER-ONLY subscription (footers 90, 91, live-head 122; no account payloads) — the live-head footer alone in the cursor",
+            Script::QuietWindow => "F: quiet subscription, replay window slid past the cursor (cursor-only-advance fix scenario)",
+            Script::QuietResume => "F-CONTROL: quiet subscription, window still holds the cursor slot",
         },
         "sdk_source": "helius-laserstream 2.0.0 from crates.io (its client.rs cursor logic is byte-identical to main 379a6ba: tracked_slot = s.slot on any slot update, payload slots never advance the cursor)",
         "mock_ignores_from_slot": true,
-        "server_behavior": "the mock replays its fixed script regardless of from_slot; reconnect_from_slot is the measurement",
+        "server_behavior": if quiet_flag {
+            "the mock answers from_slot below first_available with OUT_OF_RANGE and holds the connection open"
+        } else {
+            "the mock replays its fixed script regardless of from_slot; reconnect_from_slot is the measurement"
+        },
         "commitment": "confirmed",
+        "consumer_options_intra_slot_updates": std::env::var("INTRA_SLOT_UPDATES").is_ok(),
+        "sdk_rule": std::env::var("MEASURE_RULE").unwrap_or_else(|_| "main".into()),
         "script": if script == Script::SlotTick {
             "payload@90, payload@91, PROCESSED slot tick @122 (user filter), stream end -> reconnect"
         } else if script == Script::SlotTickMatchingCommitment {
@@ -427,17 +586,23 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
             "payload@90, payload@91, BLOCK FOOTER@122 (user filter 'footers'), stream end -> reconnect"
         } else if script == Script::FooterOnly {
             "footer@90, footer@91, footer@122 (live head), stream end -> reconnect"
+        } else if quiet_flag {
+            "payload@90, payload@91, stream end; chain advances while the consumer stays quiet"
         } else {
             "payload@90, payload@91, stream end -> reconnect"
         },
         "connection1_delivered_slots": delivered.iter().filter(|&&s| s <= LAST_DELIVERED).collect::<Vec<_>>(),
         "reconnect_from_slot": reconnect_from,
+        "reconnect_attempts": obs.conns.len().saturating_sub(1),
         "expected_resume_slot": EXPECTED_RESUME,
         "payloads_delivered_after_reconnect": delivered.iter().filter(|&&s| s >= EXPECTED_RESUME).count(),
         "slots_a_compliant_server_would_never_redeliver": skipped,
         "defect_present": matches!(reconnect_from, Some(s) if s > LAST_DELIVERED),
         "skipped_range_size": SKIPPED_RANGE,
         "compliant_server_mode": honor,
+        "replay_window_floor_harness": quiet.map(|q| q.window_floor),
+        "out_of_range_replies": obs.out_of_range_replies,
+        "consumer_errors": obs.consumer_errors,
         "delivered_account_slots_by_conn": obs.account_slots,
         "delivered_footer_slots_by_conn": obs.footer_slots,
         "footer_only_consumer": script == Script::FooterOnly,
@@ -449,7 +614,110 @@ async fn run(script: Script, out_path: &str) -> serde_json::Value {
 
 #[tokio::main]
 async fn main() {
+    if std::env::var("SCENARIO").as_deref() == Ok("quiet") {
+        run_quiet().await;
+        return;
+    }
     run_both().await;
+}
+
+/// The quiet-subscription measurement (2026-11-20).
+///
+/// The open half of #115 (akshatcoder-hash, 18:20Z): if the cursor advances
+/// ONLY on delivered payload slots, a subscription that goes quiet stops
+/// advancing the cursor — and a replay window that slid past the cursor then
+/// answers OUT_OF_RANGE. Measured as a 2x2 over RULE x WINDOW, both on the
+/// SDK's default options (OUT_OF_RANGE is a transient error, retried every
+/// 5 s) and once with intra_slot_updates = true (the SDK's own switch that
+/// makes OUT_OF_RANGE terminal and surfaces it to the consumer):
+///
+///   F (QuietWindow, aged):   floor 130 -> a 122-cursor is refused.
+///   F-control (QuietResume): floor 0   -> the replay works.
+///
+/// Rule = main 2.0.0 (tracked_slot rides ANY slot update incl. the internal
+/// tracker) vs PR #114 (replay_cursor_slot: payload slots only).
+async fn run_quiet() {
+    let dir = std::env::var("MEASURE_OUT").unwrap_or_else(|_| ".".into());
+    let intra = std::env::var("INTRA_SLOT_UPDATES").as_deref() == Ok("1");
+    let options = if intra { "intra-slot-updates" } else { "default-options" };
+    let rule = std::env::var("MEASURE_RULE").unwrap_or_else(|_| "main".into());
+
+    let aged = run_with(
+        Script::QuietWindow,
+        &format!("{dir}/laserstream-115-quiet-aged-rule-{rule}-{options}-2026-11-20.json"),
+        true,
+    )
+    .await;
+    println!("QUIET AGED ({rule}): {}", serde_json::to_string_pretty(&aged).unwrap());
+
+    let control = run_with(
+        Script::QuietResume,
+        &format!("{dir}/laserstream-115-quiet-resume-rule-{rule}-{options}-2026-11-20.json"),
+        true,
+    )
+    .await;
+    println!("QUIET RESUME ({rule}): {}", serde_json::to_string_pretty(&control).unwrap());
+
+    // Falsification guards. Each one pins a claim this report makes; if the
+    // measurement changes, the claim must be re-checked, not asserted away.
+    //
+    // 1. The aged window MUST refuse a cursor that lags the floor, otherwise
+    //    the scenario did not happen (vacuous finding). Main asks for 122,
+    //    PR #114 asks for 91 — both below the floor 130.
+    assert_eq!(
+        aged["out_of_range_replies"].as_u64().unwrap_or(0) > 0,
+        true,
+        "the aged window must refuse the lagging cursor with OUT_OF_RANGE"
+    );
+    // 2. Main's cursor rides the internal tracker to 122 in the held window:
+    //    it is served and skips 92..121 — the #115 defect in its quiet form.
+    if rule == "main" {
+        assert_eq!(
+            aged["reconnect_from_slot"].as_u64().unwrap_or(0),
+            LIVE_SLOT,
+            "main: the internal tracker must carry the cursor to the live head"
+        );
+    } else {
+        // 3. PR #114's payload-only cursor must NOT reach the live head: it
+        //    stops at the newest delivered payload (91) — that is what makes
+        //    it MORE exposed to age-out, not less.
+        assert_eq!(
+            aged["reconnect_from_slot"].as_u64().unwrap_or(0),
+            LAST_DELIVERED,
+            "pr114: the payload-only cursor must stop at the last delivered payload"
+        );
+    }
+    // 4. The control MUST be served (the replay still works in-window) — this
+    //    is the false-positive guard: if the control were refused too, the
+    //    finding would only describe the mock.
+    assert_eq!(
+        control["out_of_range_replies"].as_u64().unwrap_or(0),
+        0,
+        "the in-window control must not be refused"
+    );
+    assert_eq!(
+        control["payloads_delivered_after_reconnect"].as_u64().unwrap_or(0) > 0,
+        true,
+        "the in-window control must actually replay payloads"
+    );
+    // 5. With default options the OUT_OF_RANGE is NOT surfaced to the consumer
+    //    (it is a transient error): the subscription stalls silently. That is
+    //    the defect this measurement exists for — it must be observed.
+    //    With intra_slot_updates the SDK treats it as terminal and the
+    //    consumer DOES see the error.
+    if intra {
+        assert_eq!(
+            aged["consumer_errors"].as_array().map(|a| a.len()).unwrap_or(0) > 0,
+            true,
+            "intra_slot_updates: the consumer must see the OUT_OF_RANGE"
+        );
+    } else {
+        assert_eq!(
+            aged["consumer_errors"].as_array().map(|a| a.len()).unwrap_or(0),
+            0,
+            "default options: the consumer must NOT see the OUT_OF_RANGE (silent stall)"
+        );
+    }
 }
 
 async fn run_both() {

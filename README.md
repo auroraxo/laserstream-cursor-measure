@@ -65,12 +65,65 @@ The PR #114 diff this measured is vendored verbatim at
 `tools/pr114-replay-cursor.patch` (branch `bert/replay-cursor-from-delivered-update`,
 head `708edd3`).
 
+## The quiet-subscription age-out measurement (2026-11-20)
+
+The open half of the thread (akshatcoder-hash, 18:20Z): if the cursor advances
+ONLY on delivered payload slots, a subscription that goes quiet stops advancing
+the cursor — and a replay window that slid past the cursor then answers
+`OUT_OF_RANGE`. Measured as a 2×2 over RULE × WINDOW, each with the SDK's
+default options (OUT_OF_RANGE is a transient error, silently retried every
+5 s) and with `intra_slot_updates = true` (the SDK's switch that makes it
+terminal). Scenario: payload@90, payload@91, then ONE tick from the SDK's own
+internal slot tracker @122 (the only thing a quiet subscription still
+receives), then silence. Aged window = retention floor 130; held window =
+floor 0.
+
+| rule | window | from_slot | OUT_OF_RANGE | consumer sees | replay covers |
+|---|---|---|---|---|---|
+| main 2.0.0 | aged (floor 130) | **122** | yes (2) | **nothing** (0 errors, silent retries) | — |
+| main 2.0.0 | aged + intra_slot_updates | 122 | yes | terminal `OutOfRange` error | — |
+| PR #114 | aged (floor 130) | **91** | yes (2) | **nothing** (0 errors, silent retries) | — |
+| PR #114 | aged + intra_slot_updates | 91 | yes | terminal `OutOfRange` error | — |
+| main 2.0.0 | held (floor 0) | 122 | no | ok | **only 122 — loses 92..121** |
+| PR #114 | held (floor 0) | 91 | no | ok | 91..122, zero loss |
+
+The findings, in one line each:
+
+- **The reservation holds for PR #114 too.** Its payload-only cursor does not
+  ride the tracker (it stops at 91), but at age-out it is refused exactly like
+  main — and it would be refused *earlier* (91 lags 122). The age-out
+  behaviour akshatcoder-hash worried about is inherent to ANY slot cursor:
+  once retention moves past the last thing the cursor names, the server must
+  refuse, whatever the advancing rule is.
+- **Main's cursor is not payload-only today** — on a quiet subscription it
+  rides the SDK's internal slot tracker to the live head (122). So the
+  proposed fix does not merely "keep the cursor current": it replaces a
+  cursor that tracks the chain with one that tracks delivery, and buys the
+  in-window recovery (91..122 vs main's loss of 92..121) at the price of
+  aging out sooner.
+- **The stall is invisible by default.** OUT_OF_RANGE is a transient error
+  unless `intra_slot_updates` is set: with default options the consumer sees
+  0 errors while the SDK silently retries the same refused slot every 5 s.
+  The SDK already owns the switch that makes the failure loud; it is off.
+
+Limits: mock geyser (window model = a single retention floor, real LaserStream
+retention approximated, not measured against live infrastructure); Rust SDK
+only; PR #114 applied to the 2.0.0 crate, not a live branch checkout.
+
+Per-cell JSON: `research/laserstream-115-quiet-{aged,resume}-rule-{main,pr114}-{default-options,intra-slot-updates}-2026-11-20.json`,
+matrix summary: `research/laserstream-115-quiet-subscription-matrix-2026-11-20.json`.
+Regression: all twelve 2026-11-19 cells (main and PR #114, compliant-server
+mode) reproduce IDENTICAL on the extended harness.
+
 ## Run
 
 ```bash
 cargo run                      # non-compliant server: makes the skip visible
 HONOR_FROM_SLOT=1 cargo run    # compliant server: what the consumer actually receives
-# writes laserstream-115-{variant-a,variant-b,variant-c,variant-d-footer,variant-e-footer-only,control}-<date>.json
+SCENARIO=quiet cargo run       # quiet-subscription age-out (default options)
+SCENARIO=quiet INTRA_SLOT_UPDATES=1 cargo run   # ... with intra_slot_updates
+# the PR #114 rule: build via .pr114-run (vendored patched crate) and
+# MEASURE_RULE=pr114; see research/laserstream-115-quiet-subscription-matrix
 ```
 
 ~15 s after the first build, no network, no API key, no SDK checkout: the
