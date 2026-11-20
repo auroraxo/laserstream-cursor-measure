@@ -1,4 +1,5 @@
 {
+  "chain_head_harness": 122,
   "commitment": "confirmed",
   "compliant_server_mode": false,
   "connection1_delivered_slots": [
@@ -24,6 +25,7 @@
   ],
   "delivered_footer_slots_by_conn": [],
   "expected_resume_slot": 92,
+  "first_available_reported": null,
   "footer_only_consumer": false,
   "issue": "helius-labs/laserstream-sdk#115",
   "mock_ignores_from_slot": true,
@@ -31,6 +33,7 @@
   "payloads_delivered_after_reconnect": 1,
   "reconnect_attempts": 1,
   "reconnect_from_slot": 122,
+  "replay_info_queries": 0,
   "replay_window_floor_harness": 0,
   "scenario": "QUIET_RESUME: window still holds the cursor slot -> replay",
   "script": "payload@90, payload@91, stream end; chain advances while the consumer stays quiet",

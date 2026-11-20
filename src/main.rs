@@ -64,6 +64,12 @@ enum Script {
     /// QUIET + HELD: the same quiet subscription, but the server's replay
     /// window still holds the last delivered payload slot.
     QuietResume,
+    /// QUIET + CLAMP: the same quiet age-out as QuietWindow, but the chain
+    /// advanced to 136 while the consumer was silent (retention floor 130,
+    /// head 136) — the scenario where a consumer-side clamp has real work:
+    /// the window evicted 92..129, so a clamp at first_available=130 must
+    /// resume delivery at 130..=136 and DECLARE 92..129 as a gap.
+    QuietClamp,
 }
 
 /// A quiet-subscription scenario: the server's replay window and what it does
@@ -76,16 +82,23 @@ enum Script {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct QuietScenario {
     window_floor: u64,
+    /// Highest slot with payload after the silence (>= window_floor).
+    chain_head: u64,
 }
 
 /// The window slid on: silence outlasted retention, so the floor moved past
 /// even the live-head slot the SDK's internal tracker rides (122). A cursor
 /// that asks for 122 is now refused; a payload-only cursor sends NO from_slot
 /// and cannot be refused at all.
-const QUIET_AGED: QuietScenario = QuietScenario { window_floor: LIVE_SLOT + 8 };
+const QUIET_AGED: QuietScenario = QuietScenario { window_floor: LIVE_SLOT + 8, chain_head: LIVE_SLOT };
 
 /// The window still holds the last delivered payload (91): the replay works.
-const QUIET_RESUME: QuietScenario = QuietScenario { window_floor: 0 };
+const QUIET_RESUME: QuietScenario = QuietScenario { window_floor: 0, chain_head: LIVE_SLOT };
+
+/// QUIET + CLAMP: retention floor 130, chain head 136. The chain advanced
+/// 38 slots past the last delivered payload while the consumer was silent —
+/// exactly the shape the age-out stall hides.
+const QUIET_CLAMP: QuietScenario = QuietScenario { window_floor: 130, chain_head: 136 };
 
 #[derive(Debug, Clone)]
 struct Conn {
@@ -104,6 +117,10 @@ struct Observed {
     consumer_errors: Vec<String>,
     /// how many times the server answered OUT_OF_RANGE
     out_of_range_replies: usize,
+    /// how often the consumer asked the server what it can still replay
+    replay_info_queries: usize,
+    /// first_available the server reported to that consumer
+    first_available_reported: Option<u64>,
     /// wall-clock delay between two consecutive connect attempts
     reconnect_delays_ms: Vec<u128>,
 }
@@ -242,7 +259,10 @@ impl Geyser for MockGeyser {
                     yield Ok(slot_tick_status(LIVE_SLOT, true, CommitmentLevel::Confirmed));
                 } else if script == Script::SlotTickInternalOnly {
                     yield Ok(slot_tick_status_id(LIVE_SLOT, internal_id.clone()));
-                } else if script == Script::QuietWindow || script == Script::QuietResume {
+                } else if script == Script::QuietWindow
+                    || script == Script::QuietResume
+                    || script == Script::QuietClamp
+                {
                     // QUIET: deliver the two payloads, then exactly ONE live
                     // tick from the SDK's own internal tracker — tagged only
                     // with the internal filter id, like a real LaserStream
@@ -269,7 +289,10 @@ impl Geyser for MockGeyser {
                         }
                         yield Ok(block_footer(s, "footers".to_string()));
                     }
-                } else if script == Script::QuietWindow || script == Script::QuietResume {
+                } else if script == Script::QuietWindow
+                    || script == Script::QuietResume
+                    || script == Script::QuietClamp
+                {
                     // A from_slot AT OR ABOVE the window floor is served from
                     // that slot (inclusive); a from_slot BELOW it is refused
                     // with OUT_OF_RANGE, like a real server whose retention
@@ -285,7 +308,7 @@ impl Geyser for MockGeyser {
                             }
                             yield Err(Status::out_of_range(oor_detail));
                         } else {
-                            for s in f..=LIVE_SLOT {
+                            for s in f..=q.chain_head {
                                 {
                                     let mut o = observed.lock().unwrap();
                                     o.account_slots.push((conn_index, s));
@@ -300,8 +323,8 @@ impl Geyser for MockGeyser {
                     } else {
                         // No cursor in the request: a real server replays from
                         // its earliest held slot (first_available = the floor).
-                        let start = std::cmp::max(90, q.window_floor.min(LIVE_SLOT + 1));
-                        for s in start..=LIVE_SLOT {
+                        let start = std::cmp::max(90, q.window_floor.min(q.chain_head + 1));
+                        for s in start..=q.chain_head {
                             {
                                 let mut o = observed.lock().unwrap();
                                 o.account_slots.push((conn_index, s));
@@ -351,8 +374,13 @@ impl Geyser for MockGeyser {
         &self,
         _: Request<SubscribeReplayInfoRequest>,
     ) -> Result<Response<SubscribeReplayInfoResponse>, Status> {
+        {
+            let mut o = self.observed.lock().unwrap();
+            o.replay_info_queries += 1;
+            o.first_available_reported = self.quiet.map(|q| q.window_floor);
+        }
         Ok(Response::new(SubscribeReplayInfoResponse {
-            first_available: Some(1),
+            first_available: self.quiet.map(|q| q.window_floor),
         }))
     }
 
@@ -567,6 +595,7 @@ async fn run_with(script: Script, out_path: &str, quiet_run: bool) -> serde_json
             Script::FooterOnly => "E: FOOTER-ONLY subscription (footers 90, 91, live-head 122; no account payloads) — the live-head footer alone in the cursor",
             Script::QuietWindow => "F: quiet subscription, replay window slid past the cursor (cursor-only-advance fix scenario)",
             Script::QuietResume => "F-CONTROL: quiet subscription, window still holds the cursor slot",
+            Script::QuietClamp => "G: quiet subscription, chain advanced to 136 behind floor 130 — the consumer-side clamp repair scenario",
         },
         "sdk_source": "helius-laserstream 2.0.0 from crates.io (its client.rs cursor logic is byte-identical to main 379a6ba: tracked_slot = s.slot on any slot update, payload slots never advance the cursor)",
         "mock_ignores_from_slot": true,
@@ -580,6 +609,8 @@ async fn run_with(script: Script, out_path: &str, quiet_run: bool) -> serde_json
         "sdk_rule": std::env::var("MEASURE_RULE").unwrap_or_else(|_| "main".into()),
         "script": if script == Script::SlotTick {
             "payload@90, payload@91, PROCESSED slot tick @122 (user filter), stream end -> reconnect"
+        } else if script == Script::QuietClamp {
+            "payload@90, payload@91, internal tick @122, silence; chain head 136 behind floor 130"
         } else if script == Script::SlotTickMatchingCommitment {
             "payload@90, payload@91, CONFIRMED slot tick @122 (status == request commitment), stream end -> reconnect"
         } else if script == Script::BlockFooter {
@@ -594,6 +625,9 @@ async fn run_with(script: Script, out_path: &str, quiet_run: bool) -> serde_json
         "connection1_delivered_slots": delivered.iter().filter(|&&s| s <= LAST_DELIVERED).collect::<Vec<_>>(),
         "reconnect_from_slot": reconnect_from,
         "reconnect_attempts": obs.conns.len().saturating_sub(1),
+        "replay_info_queries": obs.replay_info_queries,
+        "first_available_reported": obs.first_available_reported,
+        "chain_head_harness": quiet.map(|q| q.chain_head),
         "expected_resume_slot": EXPECTED_RESUME,
         "payloads_delivered_after_reconnect": delivered.iter().filter(|&&s| s >= EXPECTED_RESUME).count(),
         "slots_a_compliant_server_would_never_redeliver": skipped,
@@ -616,6 +650,10 @@ async fn run_with(script: Script, out_path: &str, quiet_run: bool) -> serde_json
 async fn main() {
     if std::env::var("SCENARIO").as_deref() == Ok("quiet") {
         run_quiet().await;
+        return;
+    }
+    if std::env::var("SCENARIO").as_deref() == Ok("quiet-clamp") {
+        run_quiet_clamp().await;
         return;
     }
     run_both().await;
@@ -718,6 +756,348 @@ async fn run_quiet() {
             "default options: the consumer must NOT see the OUT_OF_RANGE (silent stall)"
         );
     }
+}
+
+/// The consumer-side clamp repair measurement (2026-11-20).
+///
+/// PULS 4 proved the age-out reservation holds for ANY slot cursor. This
+/// measurement asks the open design question the thread left: does the
+/// SDK's OWN documented repair actually work, and what does it cost?
+///
+/// The SDK ships three pieces that together form the repair:
+///   1. `LaserstreamClient::subscribe_replay_info()` returns
+///      `first_available` — the oldest slot the server can still replay;
+///   2. `subscribe_with_options(..., SubscribeOptions::with_intra_slot_updates(true))`
+///      turns the silent OUT_OF_RANGE retry loop into a TERMINAL error the
+///      consumer can see;
+///   3. a fresh `subscribe()` with an explicit `from_slot =
+///      max(cursor, first_available)` resumes at the server's floor.
+///
+/// QUIET_CLAMP: payload@90, payload@91, ONE internal tick @122, then
+/// silence; the chain advances to 136 behind retention floor 130, so the
+/// window evicted 92..129 (38 slots).
+///
+/// Cells measured:
+///   silent (default options) : the consumer sees 0 errors, retries the
+///       refused 122 forever — the stall PULS 4 found.
+///   intra  (terminal)       : the consumer SEES the terminal OutOfRange.
+///   clamp  (repair)         : consumer queries subscribe_replay_info
+///       (-> first_available=130), re-subscribes with from_slot=130,
+///       resumes 130..136, DECLARES 92..129 as a gap.
+///   unclamped control       : re-subscribing at the old cursor (122) is
+///       refused AGAIN — the clamp is what makes the repair work, not the
+///       re-subscribe alone (false-positive guard).
+async fn run_quiet_clamp() {
+    let dir = std::env::var("MEASURE_OUT").unwrap_or_else(|_| ".".into());
+    let config = LaserstreamConfig {
+        api_key: String::new(),
+        endpoint: String::new(),
+        max_reconnect_attempts: Some(6),
+        channel_options: helius_laserstream::ChannelOptions::default(),
+        replay: true,
+    };
+    let request = client_request();
+
+    // --- CELL 1: silent — default options. ---
+    let silent = clamp_cell(&config, &request, 15, false).await;
+    println!("QUIET CLAMP SILENT: {}", serde_json::to_string_pretty(&silent).unwrap());
+
+    // --- CELL 2: intra_slot_updates — the consumer sees the terminal error. ---
+    let intra = clamp_cell(&config, &request, 15, true).await;
+    println!("QUIET CLAMP INTRA: {}", serde_json::to_string_pretty(&intra).unwrap());
+
+    // --- CELL 3: clamp repair — subscribe_replay_info + fresh from_slot. ---
+    let repair = clamp_repair(&config, &request, 15).await;
+    println!("QUIET CLAMP REPAIR: {}", serde_json::to_string_pretty(&repair).unwrap());
+
+    // --- CELL 4: unclamped control — same repair WITHOUT the clamp. ---
+    let control = clamp_control(&config, &request, 15).await;
+    println!("QUIET CLAMP CONTROL: {}", serde_json::to_string_pretty(&control).unwrap());
+
+    for (name, cell) in [("silent", &silent), ("intra", &intra), ("repair", &repair), ("control", &control)] {
+        let path = format!("{dir}/laserstream-115-quiet-clamp-{name}-2026-11-20.json");
+        std::fs::write(&path, serde_json::to_string_pretty(cell).unwrap()).unwrap();
+    }
+
+    // --- Falsification guards: each claim must be observed. ---
+    // 1. Silent cell: the OUT_OF_RANGE never reaches the consumer.
+    assert_eq!(
+        silent["consumer_errors"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "silent cell: the consumer must see 0 errors (the stall is invisible)"
+    );
+    assert_eq!(
+        silent["out_of_range_replies"].as_u64().unwrap_or(0) > 0,
+        true,
+        "silent cell: the server must have refused the cursor at least once"
+    );
+    // 2. Intra cell: the consumer DOES see the terminal error.
+    assert_eq!(
+        intra["consumer_errors"].as_array().map(|a| a.len()).unwrap_or(0) > 0,
+        true,
+        "intra cell: the consumer must see the terminal OUT_OF_RANGE"
+    );
+    // 3. Repair cell: first_available is reported, the clamp resumes at 130,
+    //    the evicted range is declared as a gap, and delivery continues.
+    assert_eq!(
+        repair["replay_info_queries"].as_u64().unwrap_or(0),
+        1,
+        "repair cell: exactly one subscribe_replay_info query"
+    );
+    assert_eq!(
+        repair["first_available_reported"].as_u64().unwrap_or(0),
+        130,
+        "repair cell: first_available must be the server's floor 130"
+    );
+    assert_eq!(
+        repair["clamp_from_slot"].as_u64().unwrap_or(0),
+        130,
+        "repair cell: the clamp must clamp to 130, not the stale cursor"
+    );
+    assert_eq!(
+        repair["delivered_after_clamp"].as_array().map(|a| a.len()).unwrap_or(0) >= 5,
+        true,
+        "repair cell: delivery must resume at the floor"
+    );
+    assert_eq!(
+        repair["gap_declared_range_size"].as_u64().unwrap_or(0),
+        38,
+        "repair cell: the declared gap must be exactly 92..129"
+    );
+    // 4. Control cell: re-subscribing at the OLD cursor is refused again —
+    //    the clamp is what makes the repair work.
+    assert_eq!(
+        control["out_of_range_replies"].as_u64().unwrap_or(0) > 0,
+        true,
+        "control cell: the unclamped re-subscribe must be refused again"
+    );
+    assert_eq!(
+        control["delivered_after_clamp"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "control cell: no delivery without the clamp"
+    );
+}
+
+/// Run the QUIET_CLAMP scenario once: payloads + tick, silence, reconnect.
+/// Returns the observed state as JSON.
+async fn clamp_cell(
+    config: &LaserstreamConfig,
+    request: &SubscribeRequest,
+    secs: u64,
+    intra: bool,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let (endpoint, observed, task) = start_server_full(Script::QuietClamp, true, Some(QUIET_CLAMP)).await;
+    let cfg = LaserstreamConfig { endpoint, ..config.clone() };
+
+    type ClientStream = std::pin::Pin<
+        Box<dyn futures::Stream<
+            Item = Result<laserstream_core_proto::geyser::SubscribeUpdate, helius_laserstream::LaserstreamError>,
+        > + Send>,
+    >;
+    let (mut stream, _handle): (ClientStream, _) = if intra {
+        let (s, h) = helius_laserstream::subscribe_with_options(
+            cfg,
+            request.clone(),
+            helius_laserstream::SubscribeOptions::default().with_intra_slot_updates(true),
+        );
+        (Box::pin(s) as ClientStream, h)
+    } else {
+        let (s, h) = helius_laserstream::subscribe(cfg, request.clone());
+        (Box::pin(s) as ClientStream, h)
+    };
+
+    let mut delivered: Vec<u64> = Vec::new();
+    let mut consumer_errors: Vec<String> = Vec::new();
+
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(update))) => {
+                if let Some(laserstream_core_proto::geyser::subscribe_update::UpdateOneof::Account(a)) =
+                    update.update_oneof
+                {
+                    delivered.push(a.slot);
+                }
+            }
+            Ok(Some(Err(err))) => {
+                let msg = format!("{err}");
+                if !consumer_errors.contains(&msg) {
+                    consumer_errors.push(msg);
+                }
+                if intra {
+                    // Terminal error: the consumer is free to repair.
+                    break;
+                }
+                // Default options: the SDK retries silently; keep draining.
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
+    let obs = observed.lock().unwrap().clone();
+
+    serde_json::json!({
+        "scenario": "QUIET_CLAMP: chain head 136 behind floor 130; evicted 92..129 (38 slots)",
+        "consumer_options": if intra { "intra-slot-updates" } else { "default-options" },
+        "reconnect_from_slots": obs.conns.iter().map(|c| c.from_slot).collect::<Vec<_>>(),
+        "reconnect_attempts": obs.conns.len().saturating_sub(1),
+        "out_of_range_replies": obs.out_of_range_replies,
+        "replay_info_queries": obs.replay_info_queries,
+        "first_available_reported": obs.first_available_reported,
+        "consumer_errors": consumer_errors,
+        "delivered_slots": delivered,
+    })
+}
+
+/// The repair cell: on the terminal error, query subscribe_replay_info,
+/// clamp to first_available, re-subscribe, declare the gap.
+async fn clamp_repair(
+    config: &LaserstreamConfig,
+    request: &SubscribeRequest,
+    secs: u64,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    // Phase 1: subscribe until the terminal error surfaces.
+    let (endpoint, observed, task) = start_server_full(Script::QuietClamp, true, Some(QUIET_CLAMP)).await;
+    let cfg = LaserstreamConfig { endpoint: endpoint.clone(), ..config.clone() };
+    let (mut stream, _handle) = {
+        let (s, h) = helius_laserstream::subscribe_with_options(
+            cfg.clone(),
+            request.clone(),
+            helius_laserstream::SubscribeOptions::default().with_intra_slot_updates(true),
+        );
+        (Box::pin(s), h)
+    };
+
+    let mut delivered: Vec<u64> = Vec::new();
+    let mut phase1_errors: Vec<String> = Vec::new();
+    let mut saw_terminal = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(update))) => {
+                if let Some(laserstream_core_proto::geyser::subscribe_update::UpdateOneof::Account(a)) =
+                    update.update_oneof
+                {
+                    delivered.push(a.slot);
+                }
+            }
+            Ok(Some(Err(err))) => {
+                let msg = format!("{err}");
+                if !phase1_errors.contains(&msg) {
+                    phase1_errors.push(msg);
+                }
+                saw_terminal = true;
+                break;
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
+
+    // Phase 2: the SDK's OWN documented repair.
+    let client = helius_laserstream::LaserstreamClient::connect(LaserstreamConfig { endpoint: endpoint.clone(), ..config.clone() }).await.expect("connect");
+    let info = client.subscribe_replay_info().await.expect("replay info");
+    let first_available = info.first_available.expect("server reports first_available");
+    let clamp_from = first_available.max(request.from_slot.unwrap_or(0));
+    let gap = if clamp_from > LAST_DELIVERED {
+        (LAST_DELIVERED + 1..clamp_from).collect::<Vec<u64>>()
+    } else {
+        Vec::new()
+    };
+
+    let mut repair_request = request.clone();
+    repair_request.from_slot = Some(clamp_from);
+    let (mut stream2, _handle2) = {
+        let (s, h) = helius_laserstream::subscribe(LaserstreamConfig { endpoint: endpoint.clone(), ..config.clone() }, repair_request);
+        (Box::pin(s), h)
+    };
+
+    let mut delivered_after: Vec<u64> = Vec::new();
+    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline2 {
+        match tokio::time::timeout_at(deadline2, stream2.next()).await {
+            Ok(Some(Ok(update))) => {
+                if let Some(laserstream_core_proto::geyser::subscribe_update::UpdateOneof::Account(a)) =
+                    update.update_oneof
+                {
+                    delivered_after.push(a.slot);
+                }
+            }
+            _ => {}
+        }
+    }
+    let obs = observed.lock().unwrap().clone();
+
+    serde_json::json!({
+        "scenario": "QUIET_CLAMP: chain head 136 behind floor 130; evicted 92..129 (38 slots)",
+        "consumer_options": "intra-slot-updates",
+        "reconnect_from_slots": obs.conns.iter().map(|c| c.from_slot).collect::<Vec<_>>(),
+        "out_of_range_replies_phase1": obs.out_of_range_replies,
+        "replay_info_queries": obs.replay_info_queries,
+        "first_available_reported": obs.first_available_reported,
+        "clamp_from_slot": clamp_from,
+        "gap_declared_range": gap,
+        "gap_declared_range_size": gap.len() as u64,
+        "phase1_consumer_errors": phase1_errors,
+        "delivered_phase1": delivered,
+        "delivered_after_clamp": delivered_after,
+    })
+}
+
+/// The control: same repair but WITHOUT clamping — re-subscribe at the old
+/// cursor (122). The server must refuse again.
+async fn clamp_control(
+    config: &LaserstreamConfig,
+    request: &SubscribeRequest,
+    secs: u64,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let (endpoint, observed, task) = start_server_full(Script::QuietClamp, true, Some(QUIET_CLAMP)).await;
+    let cfg = LaserstreamConfig { endpoint: endpoint.clone(), ..config.clone() };
+    let (mut stream, _handle) = {
+        let (s, h) = helius_laserstream::subscribe_with_options(
+            cfg,
+            request.clone(),
+            helius_laserstream::SubscribeOptions::default().with_intra_slot_updates(true),
+        );
+        (Box::pin(s), h)
+    };
+
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, stream.next()).await {}
+    }
+    let obs = observed.lock().unwrap().clone();
+
+    // Re-subscribe at the OLD cursor (no clamp).
+    let mut control_request = request.clone();
+    control_request.from_slot = Some(LIVE_SLOT); // 122 — the stale cursor
+    let (mut stream2, _handle2) = {
+        let (s, h) = helius_laserstream::subscribe(LaserstreamConfig { endpoint: endpoint.clone(), ..config.clone() }, control_request);
+        (Box::pin(s), h)
+    };
+
+    let mut delivered_after: Vec<u64> = Vec::new();
+    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline2 {
+        match tokio::time::timeout_at(deadline2, stream2.next()).await {
+            Ok(Some(Ok(update))) => {
+                if let Some(laserstream_core_proto::geyser::subscribe_update::UpdateOneof::Account(a)) =
+                    update.update_oneof
+                {
+                    delivered_after.push(a.slot);
+                }
+            }
+            _ => {}
+        }
+    }
+    let obs2 = observed.lock().unwrap().clone();
+
+    serde_json::json!({
+        "scenario": "QUIET_CLAMP: unclamped control — re-subscribe at stale cursor 122",
+        "consumer_options": "intra-slot-updates",
+        "reconnect_from_slots": obs.conns.iter().map(|c| c.from_slot).collect::<Vec<_>>(),
+        "out_of_range_replies": obs2.out_of_range_replies,
+        "replay_info_queries": obs2.replay_info_queries,
+        "delivered_after_clamp": delivered_after,
+    })
 }
 
 async fn run_both() {

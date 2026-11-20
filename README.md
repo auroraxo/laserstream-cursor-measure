@@ -115,6 +115,54 @@ matrix summary: `research/laserstream-115-quiet-subscription-matrix-2026-11-20.j
 Regression: all twelve 2026-11-19 cells (main and PR #114, compliant-server
 mode) reproduce IDENTICAL on the extended harness.
 
+## The consumer-side clamp repair (2026-11-20)
+
+The age-out reservation holds for ANY slot cursor — so the open design
+question is not "which cursor rule" but "what does the consumer do when the
+cursor is refused?". The SDK already ships three pieces that together form
+the repair; this measurement asks whether they actually work.
+
+Scenario (`SCENARIO=quiet-clamp`): payload@90, payload@91, ONE tick from the
+SDK's internal tracker @122, then silence — and the chain advances to **136**
+behind retention floor **130**, so the window evicted slots 92..129 (38 slots).
+
+| cell | consumer options | consumer sees | outcome |
+|---|---|---|---|
+| silent | default | **nothing** (0 errors) | server refused twice; the SDK retried the stale cursor 122 forever — the stall, invisible |
+| intra | `intra_slot_updates` | terminal `OutOfRange` | the SDK already owns the switch that makes the stall loud |
+| repair | `intra_slot_updates` + clamp | the gap | 1 `subscribe_replay_info` query → `first_available=130` → re-subscribe at `from_slot=130` → delivery resumes 130..136, and **92..129 is declared as a gap** (38 slots) |
+| control | `intra_slot_updates`, NO clamp | — | re-subscribing at the stale cursor 122 is refused AGAIN (3 refusals), 0 delivered |
+
+The findings:
+
+- **The repair is real and entirely consumer-side.** No SDK change, no server
+  change: `subscribe_replay_info` + `intra_slot_updates` + an explicit clamped
+  `from_slot` turn the silent infinite stall into a declared gap plus live
+  delivery.
+- **The cost is honest and permanent.** Slots 92..129 are unrecoverable — the
+  repair can *name* them, never refill them. What the clamp buys is truth
+  (a machine-readable gap) instead of silence.
+- **The clamp is the operative rule, not the re-subscribe.** The control
+  cell re-subscribes at the same stale cursor and is refused again. This is
+  exactly what the SDK's own `subscribe_replay_info` docstring prescribes:
+  *"Clamp with `from_slot.max(first_available)` and treat the skipped slots as
+  missed."*
+- **Default options make the repair unreachable.** The consumer never sees
+  an error, so it never learns it should repair.
+
+Per-cell JSON: `research/laserstream-115-quiet-clamp-{silent,intra,repair,control}-2026-11-20.json`,
+summary: `research/laserstream-115-quiet-clamp-summary-2026-11-20.json`.
+
+Regression: all eight quiet-matrix cells from the measurement above
+reproduce IDENTICAL after this extension (only three additive diagnostic
+keys: `chain_head_harness`, `first_available_reported`, `replay_info_queries`);
+the quiet matrix summary is byte-identical.
+
+Limits: mock geyser (window = one retention floor + a chain head); Rust SDK
+only; `subscribe_replay_info` races eviction — a real server's floor can move
+between the query and the fresh subscribe; the declared gap is the
+consumer's own bookkeeping (the SDK has no gap primitive).
+
 ## Run
 
 ```bash
@@ -122,6 +170,7 @@ cargo run                      # non-compliant server: makes the skip visible
 HONOR_FROM_SLOT=1 cargo run    # compliant server: what the consumer actually receives
 SCENARIO=quiet cargo run       # quiet-subscription age-out (default options)
 SCENARIO=quiet INTRA_SLOT_UPDATES=1 cargo run   # ... with intra_slot_updates
+SCENARIO=quiet-clamp cargo run # the consumer-side clamp repair (4 cells)
 # the PR #114 rule: build via .pr114-run (vendored patched crate) and
 # MEASURE_RULE=pr114; see research/laserstream-115-quiet-subscription-matrix
 ```
